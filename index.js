@@ -3,16 +3,14 @@ import pkg from "pg";
 import fetch from "node-fetch";
 
 const { Pool } = pkg;
-
 const app = express();
+
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PIN = process.env.ADMIN_PIN;
 const DATABASE_URL = process.env.DATABASE_URL;
-
-console.log("ADMIN_PIN:", process.env.ADMIN_PIN);
-console.log("DATABASE_URL existe:", !!process.env.DATABASE_URL);
 
 if (!ADMIN_PIN || !DATABASE_URL) {
   console.error("Faltan variables de entorno.");
@@ -24,9 +22,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-let isPinging = false;
-
-// Crear tabla si no existe
+// Crear tabla
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channels (
@@ -38,112 +34,157 @@ async function initDB() {
       last_check TIMESTAMP
     );
   `);
-  console.log("Base de datos lista");
 }
 
-// Middleware de PIN
-function auth(req, res, next) {
-  const pin = req.headers["x-pin"];
+// Middleware PIN simple
+function checkPin(req, res, next) {
+  const pin = req.query.pin || req.body.pin;
   if (pin !== ADMIN_PIN) {
-    return res.status(403).json({ error: "PIN inválido" });
+    return res.send(loginPage("PIN incorrecto"));
   }
   next();
 }
 
-// Agregar canal
-app.post("/channels", auth, async (req, res) => {
-  const { name, url } = req.body;
-  if (!name || !url) return res.status(400).json({ error: "Datos incompletos" });
+// Página login
+function loginPage(error = "") {
+  return `
+  <html>
+  <head>
+    <title>Login</title>
+    <style>
+      body{font-family:Arial;background:#111;color:#fff;text-align:center;margin-top:100px}
+      input{padding:10px;margin:5px;border-radius:5px;border:none}
+      button{padding:10px 20px;border:none;border-radius:5px;background:#00c853;color:#fff;cursor:pointer}
+      .error{color:red}
+    </style>
+  </head>
+  <body>
+    <h2>Panel Stream Guardian</h2>
+    ${error ? `<p class="error">${error}</p>` : ""}
+    <form method="POST" action="/panel">
+      <input type="password" name="pin" placeholder="PIN de acceso" required />
+      <br/>
+      <button type="submit">Entrar</button>
+    </form>
+  </body>
+  </html>
+  `;
+}
 
-  await pool.query(
-    "INSERT INTO channels (name, url) VALUES ($1, $2)",
-    [name, url]
-  );
-
-  res.json({ message: "Canal agregado" });
-});
-
-// Listar canales
-app.get("/channels", auth, async (req, res) => {
+// Dashboard
+async function dashboard(pin) {
   const result = await pool.query("SELECT * FROM channels ORDER BY id DESC");
-  res.json(result.rows);
-});
 
-// Activar / desactivar canal
-app.patch("/channels/:id", auth, async (req, res) => {
-  const { active } = req.body;
-  await pool.query(
-    "UPDATE channels SET active = $1 WHERE id = $2",
-    [active, req.params.id]
-  );
-  res.json({ message: "Estado actualizado" });
-});
+  const rows = result.rows.map(c => `
+    <tr>
+      <td>${c.id}</td>
+      <td>${c.name}</td>
+      <td style="max-width:300px;overflow:hidden">${c.url}</td>
+      <td>${c.active ? "🟢" : "🔴"}</td>
+      <td>${c.last_status}</td>
+      <td>
+        <a href="/toggle/${c.id}?pin=${pin}">Activar/Desactivar</a> |
+        <a href="/delete/${c.id}?pin=${pin}">Eliminar</a>
+      </td>
+    </tr>
+  `).join("");
 
-// Eliminar canal
-app.delete("/channels/:id", auth, async (req, res) => {
-  await pool.query("DELETE FROM channels WHERE id = $1", [req.params.id]);
-  res.json({ message: "Canal eliminado" });
-});
+  return `
+  <html>
+  <head>
+    <title>Panel</title>
+    <style>
+      body{font-family:Arial;background:#111;color:#fff;padding:20px}
+      table{width:100%;border-collapse:collapse}
+      th,td{border:1px solid #444;padding:8px;text-align:center}
+      input{padding:8px;margin:5px;border-radius:5px;border:none}
+      button{padding:8px 15px;border:none;border-radius:5px;background:#00c853;color:#fff;cursor:pointer}
+      a{color:#00e5ff}
+    </style>
+  </head>
+  <body>
+    <h2>Stream Guardian - Panel</h2>
 
-// Ruta principal
+    <form method="POST" action="/add">
+      <input type="hidden" name="pin" value="${pin}" />
+      <input type="text" name="name" placeholder="Nombre del canal" required />
+      <input type="text" name="url" placeholder="URL m3u8" required />
+      <button type="submit">Agregar Canal</button>
+    </form>
+
+    <br/>
+    <table>
+      <tr>
+        <th>ID</th>
+        <th>Nombre</th>
+        <th>URL</th>
+        <th>Activo</th>
+        <th>Status</th>
+        <th>Acciones</th>
+      </tr>
+      ${rows}
+    </table>
+  </body>
+  </html>
+  `;
+}
+
+// Rutas
 app.get("/", (req, res) => {
-  res.send("Stream Guardian activo 24/7 🚀");
+  res.send(loginPage());
 });
 
-// Endpoint para UptimeRobot
+app.post("/panel", async (req, res) => {
+  if (req.body.pin !== ADMIN_PIN) {
+    return res.send(loginPage("PIN incorrecto"));
+  }
+  res.send(await dashboard(req.body.pin));
+});
+
+app.post("/add", checkPin, async (req, res) => {
+  const { name, url, pin } = req.body;
+  await pool.query("INSERT INTO channels (name, url) VALUES ($1,$2)", [name, url]);
+  res.send(await dashboard(pin));
+});
+
+app.get("/toggle/:id", checkPin, async (req, res) => {
+  const id = req.params.id;
+  await pool.query("UPDATE channels SET active = NOT active WHERE id=$1", [id]);
+  res.send(await dashboard(req.query.pin));
+});
+
+app.get("/delete/:id", checkPin, async (req, res) => {
+  await pool.query("DELETE FROM channels WHERE id=$1", [req.params.id]);
+  res.send(await dashboard(req.query.pin));
+});
+
+// Endpoint Uptime
 app.get("/status", (req, res) => {
   res.json({ status: "online", time: new Date() });
 });
 
-// Motor de Ping optimizado
+// Motor ping automático
 async function pingChannels() {
-  if (isPinging) return;
-  isPinging = true;
-
-  try {
-    const result = await pool.query(
-      "SELECT id, url FROM channels WHERE active = true"
-    );
-
-    for (const channel of result.rows) {
-      try {
-        const response = await fetch(channel.url, {
-          method: "GET",
-          timeout: 10000
-        });
-
-        await pool.query(
-          "UPDATE channels SET last_status = $1, last_check = NOW() WHERE id = $2",
-          [response.status, channel.id]
-        );
-
-        console.log(`OK ${channel.id} - ${response.status}`);
-      } catch (err) {
-        await pool.query(
-          "UPDATE channels SET last_status = 500, last_check = NOW() WHERE id = $1",
-          [channel.id]
-        );
-
-        console.log(`ERROR ${channel.id}`);
-      }
+  const result = await pool.query("SELECT id,url FROM channels WHERE active=true");
+  for (const c of result.rows) {
+    try {
+      const response = await fetch(c.url);
+      await pool.query(
+        "UPDATE channels SET last_status=$1,last_check=NOW() WHERE id=$2",
+        [response.status, c.id]
+      );
+    } catch {
+      await pool.query(
+        "UPDATE channels SET last_status=500,last_check=NOW() WHERE id=$1",
+        [c.id]
+      );
     }
-  } catch (err) {
-    console.error("Error general de ping:", err.message);
   }
-
-  isPinging = false;
 }
 
-// Intervalo inteligente (cada 3 minutos)
 setInterval(pingChannels, 180000);
 
-// Iniciar servidor
 app.listen(PORT, async () => {
   await initDB();
-  console.log(`Servidor ultra activo en puerto ${PORT}`);
+  console.log("Panel visual activo en puerto " + PORT);
 });
-
-
-
-
-
