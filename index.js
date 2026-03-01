@@ -1,190 +1,155 @@
-import express from "express";
-import pkg from "pg";
-import fetch from "node-fetch";
+const express = require("express");
+const session = require("express-session");
+const bodyParser = require("body-parser");
+const { spawn } = require("child_process");
+const { Pool } = require("pg");
 
-const { Pool } = pkg;
 const app = express();
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
 const PORT = process.env.PORT || 3000;
-const ADMIN_PIN = process.env.ADMIN_PIN;
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (!ADMIN_PIN || !DATABASE_URL) {
-  console.error("Faltan variables de entorno.");
-  process.exit(1);
-}
+const PIN = process.env.ADMIN_PIN || "198823";
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Crear tabla
+let procesos = {};
+
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
+
+app.use(session({
+  secret: "supersecretkey",
+  resave: false,
+  saveUninitialized: false
+}));
+
+// Crear tabla si no existe
 async function initDB() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS channels (
+    CREATE TABLE IF NOT EXISTS canales (
       id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      url TEXT NOT NULL,
-      active BOOLEAN DEFAULT true,
-      last_status INTEGER DEFAULT 0,
-      last_check TIMESTAMP
-    );
+      nombre TEXT NOT NULL,
+      url TEXT NOT NULL
+    )
   `);
 }
 
-// Middleware PIN simple
-function checkPin(req, res, next) {
-  const pin = req.query.pin || req.body.pin;
-  if (pin !== ADMIN_PIN) {
-    return res.send(loginPage("PIN incorrecto"));
-  }
-  next();
+async function obtenerCanales() {
+  const res = await pool.query("SELECT * FROM canales ORDER BY id ASC");
+  return res.rows;
 }
 
-// Página login
-function loginPage(error = "") {
-  return `
-  <html>
-  <head>
-    <title>Login</title>
-    <style>
-      body{font-family:Arial;background:#111;color:#fff;text-align:center;margin-top:100px}
-      input{padding:10px;margin:5px;border-radius:5px;border:none}
-      button{padding:10px 20px;border:none;border-radius:5px;background:#00c853;color:#fff;cursor:pointer}
-      .error{color:red}
-    </style>
-  </head>
-  <body>
-    <h2>Panel Stream Guardian</h2>
-    ${error ? `<p class="error">${error}</p>` : ""}
-    <form method="POST" action="/panel">
-      <input type="password" name="pin" placeholder="PIN de acceso" required />
-      <br/>
-      <button type="submit">Entrar</button>
+function iniciarCanal(canal) {
+  if (procesos[canal.id]) return;
+
+  const ejecutar = () => {
+    const proceso = spawn("ffmpeg", [
+      "-loglevel", "error",
+      "-reconnect", "1",
+      "-reconnect_streamed", "1",
+      "-reconnect_delay_max", "5",
+      "-i", canal.url,
+      "-c", "copy",
+      "-f", "null",
+      "-"
+    ]);
+
+    procesos[canal.id] = proceso;
+
+    proceso.on("close", () => {
+      delete procesos[canal.id];
+      setTimeout(ejecutar, 5000);
+    });
+  };
+
+  ejecutar();
+}
+
+async function reiniciarTodos() {
+  Object.values(procesos).forEach(p => p.kill());
+  procesos = {};
+  const canales = await obtenerCanales();
+  canales.forEach(iniciarCanal);
+}
+
+// Middleware auth
+function auth(req, res, next) {
+  if (req.session.auth) return next();
+  res.redirect("/login");
+}
+
+// Login
+app.get("/login", (req, res) => {
+  res.send(`
+    <h2>Panel de Acceso</h2>
+    <form method="POST">
+      <input type="password" name="pin" maxlength="6" required />
+      <button>Entrar</button>
     </form>
-  </body>
-  </html>
-  `;
-}
+  `);
+});
 
-// Dashboard
-async function dashboard(pin) {
-  const result = await pool.query("SELECT * FROM channels ORDER BY id DESC");
+app.post("/login", (req, res) => {
+  if (req.body.pin === PIN) {
+    req.session.auth = true;
+    res.redirect("/");
+  } else {
+    res.send("PIN incorrecto");
+  }
+});
 
-  const rows = result.rows.map(c => `
-    <tr>
-      <td>${c.id}</td>
-      <td>${c.name}</td>
-      <td style="max-width:300px;overflow:hidden">${c.url}</td>
-      <td>${c.active ? "🟢" : "🔴"}</td>
-      <td>${c.last_status}</td>
-      <td>
-        <a href="/toggle/${c.id}?pin=${pin}">Activar/Desactivar</a> |
-        <a href="/delete/${c.id}?pin=${pin}">Eliminar</a>
-      </td>
-    </tr>
+// Panel
+app.get("/", auth, async (req, res) => {
+  const canales = await obtenerCanales();
+  let lista = canales.map(c => `
+    <li>
+      ${c.nombre}
+      <a href="/delete/${c.id}">Eliminar</a>
+    </li>
   `).join("");
 
-  return `
-  <html>
-  <head>
-    <title>Panel</title>
-    <style>
-      body{font-family:Arial;background:#111;color:#fff;padding:20px}
-      table{width:100%;border-collapse:collapse}
-      th,td{border:1px solid #444;padding:8px;text-align:center}
-      input{padding:8px;margin:5px;border-radius:5px;border:none}
-      button{padding:8px 15px;border:none;border-radius:5px;background:#00c853;color:#fff;cursor:pointer}
-      a{color:#00e5ff}
-    </style>
-  </head>
-  <body>
-    <h2>Stream Guardian - Panel</h2>
-
+  res.send(`
+    <h2>Panel Streams</h2>
+    <ul>${lista}</ul>
+    <h3>Agregar Canal</h3>
     <form method="POST" action="/add">
-      <input type="hidden" name="pin" value="${pin}" />
-      <input type="text" name="name" placeholder="Nombre del canal" required />
-      <input type="text" name="url" placeholder="URL m3u8" required />
-      <button type="submit">Agregar Canal</button>
+      <input name="nombre" placeholder="Nombre" required />
+      <input name="url" placeholder="URL m3u8" required />
+      <button>Guardar</button>
     </form>
-
-    <br/>
-    <table>
-      <tr>
-        <th>ID</th>
-        <th>Nombre</th>
-        <th>URL</th>
-        <th>Activo</th>
-        <th>Status</th>
-        <th>Acciones</th>
-      </tr>
-      ${rows}
-    </table>
-  </body>
-  </html>
-  `;
-}
-
-// Rutas
-app.get("/", (req, res) => {
-  res.send(loginPage());
+    <br><a href="/status">Ver Estado</a>
+  `);
 });
 
-app.post("/panel", async (req, res) => {
-  if (req.body.pin !== ADMIN_PIN) {
-    return res.send(loginPage("PIN incorrecto"));
-  }
-  res.send(await dashboard(req.body.pin));
+// Agregar
+app.post("/add", auth, async (req, res) => {
+  await pool.query(
+    "INSERT INTO canales (nombre, url) VALUES ($1, $2)",
+    [req.body.nombre, req.body.url]
+  );
+  await reiniciarTodos();
+  res.redirect("/");
 });
 
-app.post("/add", checkPin, async (req, res) => {
-  const { name, url, pin } = req.body;
-  await pool.query("INSERT INTO channels (name, url) VALUES ($1,$2)", [name, url]);
-  res.send(await dashboard(pin));
+// Eliminar
+app.get("/delete/:id", auth, async (req, res) => {
+  await pool.query("DELETE FROM canales WHERE id=$1", [req.params.id]);
+  await reiniciarTodos();
+  res.redirect("/");
 });
 
-app.get("/toggle/:id", checkPin, async (req, res) => {
-  const id = req.params.id;
-  await pool.query("UPDATE channels SET active = NOT active WHERE id=$1", [id]);
-  res.send(await dashboard(req.query.pin));
+// Estado
+app.get("/status", auth, async (req, res) => {
+  const canales = await obtenerCanales();
+  res.json({
+    activos: Object.keys(procesos).length,
+    canales
+  });
 });
-
-app.get("/delete/:id", checkPin, async (req, res) => {
-  await pool.query("DELETE FROM channels WHERE id=$1", [req.params.id]);
-  res.send(await dashboard(req.query.pin));
-});
-
-// Endpoint Uptime
-app.get("/status", (req, res) => {
-  res.json({ status: "online", time: new Date() });
-});
-
-// Motor ping automático
-async function pingChannels() {
-  const result = await pool.query("SELECT id,url FROM channels WHERE active=true");
-  for (const c of result.rows) {
-    try {
-      const response = await fetch(c.url);
-      await pool.query(
-        "UPDATE channels SET last_status=$1,last_check=NOW() WHERE id=$2",
-        [response.status, c.id]
-      );
-    } catch {
-      await pool.query(
-        "UPDATE channels SET last_status=500,last_check=NOW() WHERE id=$1",
-        [c.id]
-      );
-    }
-  }
-}
-
-setInterval(pingChannels, 180000);
 
 app.listen(PORT, async () => {
   await initDB();
-  console.log("Panel visual activo en puerto " + PORT);
+  await reiniciarTodos();
+  console.log("Panel iniciado con Neon");
 });
