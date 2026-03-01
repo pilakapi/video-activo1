@@ -85,11 +85,11 @@ app.delete("/channels/:id", auth, async (req, res) => {
   res.json({ message: "Canal eliminado" });
 });
 
-// Endpoint para UptimeRobot
 app.get("/", (req, res) => {
   res.send("Stream Guardian activo 24/7 🚀");
 });
 
+// Endpoint para UptimeRobot
 app.get("/status", (req, res) => {
   res.json({ status: "online", time: new Date() });
 });
@@ -141,6 +141,7 @@ app.listen(PORT, async () => {
   await initDB();
   console.log(`Servidor ultra activo en puerto ${PORT}`);
 });
+
 
 
 
