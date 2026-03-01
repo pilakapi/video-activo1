@@ -89,6 +89,7 @@ app.delete("/channels/:id", auth, async (req, res) => {
 app.get("/", (req, res) => {
   res.send("Stream Guardian activo 24/7 🚀");
 });
+
 app.get("/status", (req, res) => {
   res.json({ status: "online", time: new Date() });
 });
@@ -140,5 +141,6 @@ app.listen(PORT, async () => {
   await initDB();
   console.log(`Servidor ultra activo en puerto ${PORT}`);
 });
+
 
 
