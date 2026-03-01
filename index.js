@@ -1,155 +1,136 @@
-const express = require("express");
-const session = require("express-session");
-const bodyParser = require("body-parser");
-const { spawn } = require("child_process");
-const { Pool } = require("pg");
+import express from "express";
+import pkg from "pg";
+import fetch from "node-fetch";
+
+const { Pool } = pkg;
 
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
-const PIN = process.env.ADMIN_PIN || "198823";
+const ADMIN_PIN = process.env.ADMIN_PIN;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!ADMIN_PIN || !DATABASE_URL) {
+  console.error("Faltan variables de entorno.");
+  process.exit(1);
+}
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-let procesos = {};
-
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.json());
-
-app.use(session({
-  secret: "supersecretkey",
-  resave: false,
-  saveUninitialized: false
-}));
+let isPinging = false;
 
 // Crear tabla si no existe
 async function initDB() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS canales (
+    CREATE TABLE IF NOT EXISTS channels (
       id SERIAL PRIMARY KEY,
-      nombre TEXT NOT NULL,
-      url TEXT NOT NULL
-    )
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      active BOOLEAN DEFAULT true,
+      last_status INTEGER DEFAULT 0,
+      last_check TIMESTAMP
+    );
   `);
+  console.log("Base de datos lista");
 }
 
-async function obtenerCanales() {
-  const res = await pool.query("SELECT * FROM canales ORDER BY id ASC");
-  return res.rows;
-}
-
-function iniciarCanal(canal) {
-  if (procesos[canal.id]) return;
-
-  const ejecutar = () => {
-    const proceso = spawn("ffmpeg", [
-      "-loglevel", "error",
-      "-reconnect", "1",
-      "-reconnect_streamed", "1",
-      "-reconnect_delay_max", "5",
-      "-i", canal.url,
-      "-c", "copy",
-      "-f", "null",
-      "-"
-    ]);
-
-    procesos[canal.id] = proceso;
-
-    proceso.on("close", () => {
-      delete procesos[canal.id];
-      setTimeout(ejecutar, 5000);
-    });
-  };
-
-  ejecutar();
-}
-
-async function reiniciarTodos() {
-  Object.values(procesos).forEach(p => p.kill());
-  procesos = {};
-  const canales = await obtenerCanales();
-  canales.forEach(iniciarCanal);
-}
-
-// Middleware auth
+// Middleware de PIN
 function auth(req, res, next) {
-  if (req.session.auth) return next();
-  res.redirect("/login");
+  const pin = req.headers["x-pin"];
+  if (pin !== ADMIN_PIN) {
+    return res.status(403).json({ error: "PIN inválido" });
+  }
+  next();
 }
 
-// Login
-app.get("/login", (req, res) => {
-  res.send(`
-    <h2>Panel de Acceso</h2>
-    <form method="POST">
-      <input type="password" name="pin" maxlength="6" required />
-      <button>Entrar</button>
-    </form>
-  `);
-});
+// Agregar canal
+app.post("/channels", auth, async (req, res) => {
+  const { name, url } = req.body;
+  if (!name || !url) return res.status(400).json({ error: "Datos incompletos" });
 
-app.post("/login", (req, res) => {
-  if (req.body.pin === PIN) {
-    req.session.auth = true;
-    res.redirect("/");
-  } else {
-    res.send("PIN incorrecto");
-  }
-});
-
-// Panel
-app.get("/", auth, async (req, res) => {
-  const canales = await obtenerCanales();
-  let lista = canales.map(c => `
-    <li>
-      ${c.nombre}
-      <a href="/delete/${c.id}">Eliminar</a>
-    </li>
-  `).join("");
-
-  res.send(`
-    <h2>Panel Streams</h2>
-    <ul>${lista}</ul>
-    <h3>Agregar Canal</h3>
-    <form method="POST" action="/add">
-      <input name="nombre" placeholder="Nombre" required />
-      <input name="url" placeholder="URL m3u8" required />
-      <button>Guardar</button>
-    </form>
-    <br><a href="/status">Ver Estado</a>
-  `);
-});
-
-// Agregar
-app.post("/add", auth, async (req, res) => {
   await pool.query(
-    "INSERT INTO canales (nombre, url) VALUES ($1, $2)",
-    [req.body.nombre, req.body.url]
+    "INSERT INTO channels (name, url) VALUES ($1, $2)",
+    [name, url]
   );
-  await reiniciarTodos();
-  res.redirect("/");
+
+  res.json({ message: "Canal agregado" });
 });
 
-// Eliminar
-app.get("/delete/:id", auth, async (req, res) => {
-  await pool.query("DELETE FROM canales WHERE id=$1", [req.params.id]);
-  await reiniciarTodos();
-  res.redirect("/");
+// Listar canales
+app.get("/channels", auth, async (req, res) => {
+  const result = await pool.query("SELECT * FROM channels ORDER BY id DESC");
+  res.json(result.rows);
 });
 
-// Estado
-app.get("/status", auth, async (req, res) => {
-  const canales = await obtenerCanales();
-  res.json({
-    activos: Object.keys(procesos).length,
-    canales
-  });
+// Activar / desactivar canal
+app.patch("/channels/:id", auth, async (req, res) => {
+  const { active } = req.body;
+  await pool.query(
+    "UPDATE channels SET active = $1 WHERE id = $2",
+    [active, req.params.id]
+  );
+  res.json({ message: "Estado actualizado" });
 });
 
+// Eliminar canal
+app.delete("/channels/:id", auth, async (req, res) => {
+  await pool.query("DELETE FROM channels WHERE id = $1", [req.params.id]);
+  res.json({ message: "Canal eliminado" });
+});
+
+// Endpoint para UptimeRobot
+app.get("/status", (req, res) => {
+  res.json({ status: "online", time: new Date() });
+});
+
+// Motor de Ping optimizado
+async function pingChannels() {
+  if (isPinging) return;
+  isPinging = true;
+
+  try {
+    const result = await pool.query(
+      "SELECT id, url FROM channels WHERE active = true"
+    );
+
+    for (const channel of result.rows) {
+      try {
+        const response = await fetch(channel.url, {
+          method: "GET",
+          timeout: 10000
+        });
+
+        await pool.query(
+          "UPDATE channels SET last_status = $1, last_check = NOW() WHERE id = $2",
+          [response.status, channel.id]
+        );
+
+        console.log(`OK ${channel.id} - ${response.status}`);
+      } catch (err) {
+        await pool.query(
+          "UPDATE channels SET last_status = 500, last_check = NOW() WHERE id = $1",
+          [channel.id]
+        );
+
+        console.log(`ERROR ${channel.id}`);
+      }
+    }
+  } catch (err) {
+    console.error("Error general de ping:", err.message);
+  }
+
+  isPinging = false;
+}
+
+// Intervalo inteligente (cada 3 minutos)
+setInterval(pingChannels, 180000);
+
+// Iniciar servidor
 app.listen(PORT, async () => {
   await initDB();
-  await reiniciarTodos();
-  console.log("Panel iniciado con Neon");
+  console.log(`Servidor ultra activo en puerto ${PORT}`);
 });
