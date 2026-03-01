@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PIN = process.env.ADMIN_PIN;
 const DATABASE_URL = process.env.DATABASE_URL;
 
+console.log("ADMIN_PIN:", process.env.ADMIN_PIN);
+console.log("DATABASE_URL existe:", !!process.env.DATABASE_URL);
+
 if (!ADMIN_PIN || !DATABASE_URL) {
   console.error("Faltan variables de entorno.");
   process.exit(1);
@@ -134,3 +137,4 @@ app.listen(PORT, async () => {
   await initDB();
   console.log(`Servidor ultra activo en puerto ${PORT}`);
 });
+
