@@ -1,14 +1,15 @@
 {
-  "name": "panel-stream-neon",
+  "name": "stream-guardian",
   "version": "1.0.0",
+  "description": "Ultra optimized 24/7 stream keeper",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "express-session": "^1.17.3",
     "pg": "^8.11.3",
-    "body-parser": "^1.20.2"
+    "node-fetch": "^3.3.2"
   }
 }
