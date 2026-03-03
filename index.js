@@ -48,7 +48,7 @@ function iniciarCanal(canal) {
       "-loglevel", "error",
       "-reconnect", "1",
       "-reconnect_streamed", "1",
-      "-reconnect_delay_max", "5",
+      "-reconnect_delay_max", "15 segundos",
       "-i", canal.url,
       "-c", "copy",
       "-f", "null",
@@ -153,3 +153,4 @@ app.listen(PORT, async () => {
   await reiniciarTodos();
   console.log("Panel iniciado con Neon");
 });
+
